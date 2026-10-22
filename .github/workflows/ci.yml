@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - run: go vet ./...
+      # краулер параллельный, поэтому тесты гоняются с детектором гонок
+      - run: go test -race ./...
+
+  # Сам linkpatrol проверяет демо-сайт из репозитория: ожидаем ровно те ошибки, что в нём заложены.
+  demo:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -o linkpatrol ./cmd/linkpatrol
+      - name: Check the demo site
+        run: |
+          (cd examples/demo-site && python3 -m http.server 8000 >/dev/null 2>&1 &)
+          sleep 1
+          ./linkpatrol http://localhost:8000 -external=false -format json > report.json || true
+          ./linkpatrol http://localhost:8000 -external=false -format markdown >> "$GITHUB_STEP_SUMMARY" || true
+          test "$(jq .errors report.json)" = 4
+          test "$(jq '[.problems[] | select(.kind == "anchor")] | length' report.json)" = 1
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile
+        run: |
+          for target in linux/amd64 linux/arm64 windows/amd64 darwin/amd64 darwin/arm64; do
+            os=${target%/*} arch=${target#*/} ext=
+            [ "$os" = windows ] && ext=.exe
+            GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+              -o "dist/linkpatrol-$os-$arch$ext" ./cmd/linkpatrol
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linkpatrol-binaries
+          path: dist/
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes
